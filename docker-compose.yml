@@ -1,0 +1,256 @@
+services:
+
+  # ─── Zookeeper ────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ─── Kafka Broker ─────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  # ─── Kafka UI ─────────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: floresta-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  # ─── Kafka Topics Setup ───────────────────────────────────────────────────────
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-setup
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        echo 'A criar topics Kafka...' &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic sensor-events --partitions 3 --replication-factor 1 --config retention.ms=604800000 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic satellite-hotspots --partitions 3 --replication-factor 1 --config retention.ms=604800000 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather-data --partitions 3 --replication-factor 1 --config retention.ms=604800000 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic fire-alerts --partitions 1 --replication-factor 1 --config retention.ms=2592000000 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic data-quality-metrics --partitions 1 --replication-factor 1 --config retention.ms=604800000 &&
+        echo 'Topics criados:' &&
+        kafka-topics --bootstrap-server kafka:9092 --list
+      "
+
+  # ─── Apache Cassandra ─────────────────────────────────────────────────────────
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    restart: unless-stopped
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: "ForestRiskCluster"
+      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_RACK: "rack1"
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      MAX_HEAP_SIZE: "512M"
+      HEAP_NEWSIZE: "128M"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  # ─── Cassandra Schema Setup ───────────────────────────────────────────────────
+  cassandra-setup:
+    image: cassandra:4.1
+    container_name: cassandra-setup
+    restart: "no"
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/init.cql:/init.cql
+    command: >
+      bash -c "
+        echo 'A aplicar schema...' &&
+        until cqlsh cassandra 9042 -f /init.cql; do
+          echo 'A tentar novamente em 5s...';
+          sleep 5;
+        done &&
+        echo 'Schema aplicado!'
+      "
+
+  # ─── LocalStack (AWS S3 local) ────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      PERSISTENCE: 1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh
+
+  # ─── InfluxDB ─────────────────────────────────────────────────────────────────
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: forestrisk123
+      DOCKER_INFLUXDB_INIT_ORG: forest-risk
+      DOCKER_INFLUXDB_INIT_BUCKET: metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: forest-risk-influx-token-2024
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    restart: unless-stopped
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: forestrisk123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+
+  # ─── Jupyter Lab (PySpark em modo local + todas as bibliotecas) ───────────────
+  # NOTA: esta imagem já inclui Spark 3.5.0 — não precisas de um container Spark
+  # separado. O Spark corre em modo "local[*]" dentro do Jupyter (mais simples
+  # e suficiente para desenvolvimento e para o projeto final).
+  jupyter:
+    image: quay.io/jupyter/pyspark-notebook:spark-3.5.0
+    container_name: jupyter
+    restart: unless-stopped
+    user: root
+    depends_on:
+      kafka:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+      - "4040:4040"   # Spark UI do driver
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: "forestrisk"
+      GRANT_SUDO: "yes"
+      PYSPARK_PYTHON: python3
+      # Ligações a todos os serviços — usas com os.getenv() nos notebooks
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_PORT: "9042"
+      KAFKA_BOOTSTRAP: kafka:9092
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: forest-risk-influx-token-2024
+      INFLUXDB_ORG: forest-risk
+      INFLUXDB_BUCKET: metrics
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: eu-west-1
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - jupyter_data:/home/jovyan/.jupyter
+    command: >
+      bash -c "
+        pip install --quiet --no-cache-dir
+          cassandra-driver==3.29.1
+          kafka-python==2.0.2
+          influxdb-client==1.38.0
+          boto3==1.34.0
+          xgboost==2.0.3
+          scikit-learn==1.4.0
+          matplotlib==3.8.2
+          seaborn==0.13.1
+          plotly==5.18.0 &&
+        jupyter lab
+          --ip=0.0.0.0
+          --port=8888
+          --no-browser
+          --ServerApp.token='forestrisk'
+          --ServerApp.password=''
+          --allow-root
+      "
+
+# ─── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  zookeeper_data:
+  zookeeper_logs:
+  kafka_data:
+  cassandra_data:
+  localstack_data:
+  influxdb_data:
+  influxdb_config:
+  grafana_data:
+  jupyter_data:

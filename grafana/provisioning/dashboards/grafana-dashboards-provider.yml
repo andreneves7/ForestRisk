@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: Forest Risk Dashboards
+    folder: Forest Risk
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards
