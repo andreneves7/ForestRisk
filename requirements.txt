@@ -1,0 +1,6 @@
+kafka-python
+cassandra-driver
+influxdb-client
+requests
+pandas
+great-expectations
