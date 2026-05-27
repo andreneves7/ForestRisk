@@ -1,6 +1,7 @@
 apiVersion: 1
 datasources:
   - name: InfluxDB
+    uid: influxdb-forest-risk
     type: influxdb
     access: proxy
     url: http://influxdb:8086
@@ -12,3 +13,4 @@ datasources:
     secureJsonData:
       token: forest-risk-influx-token-2024
     isDefault: true
+    editable: false
