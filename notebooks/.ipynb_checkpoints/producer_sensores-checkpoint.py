@@ -18,10 +18,11 @@ from datetime import datetime, timezone
 from kafka import KafkaProducer
 
 # ── Configuração ──────────────────────────────────────────────────────────────
-KAFKA_BOOTSTRAP = "localhost:29092"   # fora do Docker
-# KAFKA_BOOTSTRAP = "kafka:9092"      # dentro do Jupyter/Docker
+#KAFKA_BOOTSTRAP = "localhost:29092"   # fora do Docker
+KAFKA_BOOTSTRAP = "kafka:9092"      # dentro do Jupyter/Docker
 
-INTERVALO_SEGUNDOS = 2                # envia 1 evento a cada 2 segundos
+#INTERVALO_SEGUNDOS = 2                # envia 1 evento a cada 2 segundos
+INTERVALO_SEGUNDOS = 900   # 15 minutos = 15 × 60
 LOG_LEVEL = logging.INFO
 
 logging.basicConfig(

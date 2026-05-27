@@ -233,6 +233,35 @@ services:
           --ServerApp.password=''
           --allow-root
       "
+  producer:
+    build: .
+      #--Quando usar o real mudar aqui---
+    # teste
+    command: python notebooks/producer_sensores.py
+    #Real (APIS)
+    #command: python notebooks/producer_apis_reais.py
+    depends_on:
+      - kafka
+      - cassandra
+    restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+
+  consumer:
+    build: .  
+    command: python notebooks/consumer_kafka_cassandra.py    
+    depends_on:
+      - kafka
+      - cassandra
+      - influxdb
+    restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - CASSANDRA_HOST=cassandra
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=forest-risk-influx-token-2024
+      - INFLUXDB_ORG=forest-risk
+      - INFLUXDB_BUCKET=metrics
 
 # ─── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
