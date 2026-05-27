@@ -3,4 +3,4 @@ cassandra-driver
 influxdb-client
 requests
 pandas
-great-expectations
+great-expectations==0.18.15

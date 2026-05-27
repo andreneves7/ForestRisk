@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir \
     influxdb-client \
     requests \
     pandas \
-    great-expectations
+    great-expectations==0.18.15
