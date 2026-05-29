@@ -4,3 +4,4 @@ influxdb-client
 requests
 pandas
 great-expectations==0.18.15
+pyarrow>=14.0.0
