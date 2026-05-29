@@ -39,6 +39,7 @@ from data_quality_validation import (
     run_ge_validation,
     split_valid_invalid,
 )
+from s3_writer import write_parquet_to_s3
 
 # ── Configuração ──────────────────────────────────────────────────────────────
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
@@ -203,6 +204,10 @@ def process_batch(batch: list[dict], ge_context,
         except Exception as e:
             log.error(f"Erro Cassandra: {e} | grid={ev.get('grid_id')}")
 
+    # 3b. Válidos → S3 Parquet (histórico)
+    if valid_evs:
+        write_parquet_to_s3(valid_evs, topic=topic)
+
     # 4. Inválidos → quarentena
     for ev in invalid_evs:
         rejected = build_rejected_record(ev)
@@ -309,6 +314,8 @@ def consume_satellite_hotspots(session, insert_sensor, write_api):
     )
 
     log.info("🛰️  Consumer satellite-hotspots iniciado")
+    hotspot_buffer: list[dict] = []
+    HOTSPOT_BATCH = 10
 
     for msg in consumer:
         try:
@@ -334,6 +341,12 @@ def consume_satellite_hotspots(session, insert_sensor, write_api):
                 f"🛰️  Hotspot registado — {ev.get('grid_id')} "
                 f"FRP={ev.get('frp')} Latência={latency_ms:.1f}ms"
             )
+
+            hotspot_buffer.append(ev)
+            if len(hotspot_buffer) >= HOTSPOT_BATCH:
+                write_parquet_to_s3(hotspot_buffer, topic="satellite-hotspots")
+                hotspot_buffer.clear()
+
         except Exception as e:
             log.error(f"Erro hotspot: {e} | dados: {msg.value}")
 
