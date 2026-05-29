@@ -54,6 +54,7 @@ INFLUX_BUCKET = os.getenv("INFLUXDB_BUCKET", "metrics")
 
 BATCH_SIZE    = int(os.getenv("BATCH_SIZE", "3"))
 BATCH_TIMEOUT = int(os.getenv("BATCH_TIMEOUT", "30"))
+HOTSPOT_BATCH = int(os.getenv("HOTSPOT_BATCH", "10"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -315,40 +316,45 @@ def consume_satellite_hotspots(session, insert_sensor, write_api):
 
     log.info("🛰️  Consumer satellite-hotspots iniciado")
     hotspot_buffer: list[dict] = []
-    HOTSPOT_BATCH = 10
 
-    for msg in consumer:
-        try:
-            ev          = msg.value
-            ts_str      = ev.get("timestamp", datetime.now(timezone.utc).isoformat())
-            ts          = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            hour_bucket = ts.strftime("%Y-%m-%dT%H:00:00")
+    try:
+        for msg in consumer:
+            try:
+                ev          = msg.value
+                ts_str      = ev.get("timestamp", datetime.now(timezone.utc).isoformat())
+                ts          = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                hour_bucket = ts.strftime("%Y-%m-%dT%H:00:00")
 
-            session.execute(insert_sensor, (
-                ev.get("grid_id", "PT-UNKNOWN"),
-                hour_bucket, ts, "nasa_firms",
-                float(ev.get("brightness", 0.0)),
-                0.0, 0.0, 1,
-                float(ev.get("frp", 0.0)),
-                float(ev.get("latitude", 0.0)),
-                float(ev.get("longitude", 0.0)),
-            ))
+                session.execute(insert_sensor, (
+                    ev.get("grid_id", "PT-UNKNOWN"),
+                    hour_bucket, ts, "nasa_firms",
+                    float(ev.get("brightness", 0.0)),
+                    0.0, 0.0, 1,
+                    float(ev.get("frp", 0.0)),
+                    float(ev.get("latitude", 0.0)),
+                    float(ev.get("longitude", 0.0)),
+                ))
 
-            latency_ms = (datetime.now(timezone.utc) - ts).total_seconds() * 1000
-            send_latency(write_api, INFLUX_BUCKET, INFLUX_ORG,
-                         latency_ms, "satellite-hotspots", ev.get("grid_id", "PT-UNKNOWN"))
-            log.info(
-                f"🛰️  Hotspot registado — {ev.get('grid_id')} "
-                f"FRP={ev.get('frp')} Latência={latency_ms:.1f}ms"
-            )
+                latency_ms = (datetime.now(timezone.utc) - ts).total_seconds() * 1000
+                send_latency(write_api, INFLUX_BUCKET, INFLUX_ORG,
+                             latency_ms, "satellite-hotspots", ev.get("grid_id", "PT-UNKNOWN"))
+                log.info(
+                    f"🛰️  Hotspot registado — {ev.get('grid_id')} "
+                    f"FRP={ev.get('frp')} Latência={latency_ms:.1f}ms"
+                )
 
-            hotspot_buffer.append(ev)
+            except Exception as e:
+                log.error(f"Erro hotspot: {e} | dados: {msg.value}")
+
+            hotspot_buffer.append(msg.value)
             if len(hotspot_buffer) >= HOTSPOT_BATCH:
                 write_parquet_to_s3(hotspot_buffer, topic="satellite-hotspots")
                 hotspot_buffer.clear()
 
-        except Exception as e:
-            log.error(f"Erro hotspot: {e} | dados: {msg.value}")
+    finally:
+        if hotspot_buffer:
+            write_parquet_to_s3(hotspot_buffer, topic="satellite-hotspots")
+            hotspot_buffer.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
