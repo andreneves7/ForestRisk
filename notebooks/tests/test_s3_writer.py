@@ -85,7 +85,7 @@ def test_empty_records_returns_true(s3_bucket):
     assert s3_bucket.list_objects_v2(Bucket=BUCKET).get("Contents") is None
 
 
-def test_s3_failure_returns_false_without_exception(s3_bucket):
+def test_s3_failure_returns_false_without_exception():
     """Falha S3 retorna False sem propagar excepção."""
     from s3_writer import write_parquet_to_s3
 
@@ -93,6 +93,19 @@ def test_s3_failure_returns_false_without_exception(s3_bucket):
 
     with patch("s3_writer.boto3") as mock_boto:
         mock_boto.client.return_value.put_object.side_effect = Exception("S3 timeout")
+        result = write_parquet_to_s3(records, topic="sensor-events")
+
+    assert result is False
+
+
+def test_client_creation_failure_returns_false_without_exception():
+    """Falha ao criar cliente S3 retorna False sem propagar excepção."""
+    from s3_writer import write_parquet_to_s3
+
+    records = [{"grid_id": "norte", "timestamp": "2025-05-01T10:00:00Z"}]
+
+    with patch("s3_writer.boto3") as mock_boto:
+        mock_boto.client.side_effect = Exception("auth failure")
         result = write_parquet_to_s3(records, topic="sensor-events")
 
     assert result is False

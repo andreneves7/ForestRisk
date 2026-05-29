@@ -43,11 +43,21 @@ def _build_key(prefix: str, zone_id: str, ts: datetime) -> str:
 
 
 def write_parquet_to_s3(records: list[dict], topic: str) -> bool:
+    """
+    Agrupa records por grid_id, serializa cada grupo em Parquet e faz upload.
+    Retorna True se todos os uploads tiverem sucesso, False se algum falhar.
+    Nunca propaga excepção — pipeline não é bloqueado por falha S3.
+    """
     if not records:
         return True
 
-    prefix = TOPIC_TO_PREFIX.get(topic, topic.replace("-", "_"))
-    client = _s3_client()
+    try:
+        prefix = TOPIC_TO_PREFIX.get(topic, topic.replace("-", "_"))
+        client = _s3_client()
+    except Exception as exc:
+        log.error(f"Falha ao criar cliente S3 topic={topic}: {exc}")
+        return False
+
     success = True
 
     grouped: dict[str, list[dict]] = defaultdict(list)
