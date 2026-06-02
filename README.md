@@ -29,6 +29,8 @@ Pipeline de inteligência florestal que unifica dados de sensores IoT, satélite
 ```
 projeto_docker/
 ├── docker-compose.yml          # Ambiente completo em 1 ficheiro
+├── Dockerfile                  # Imagem dos producers/consumer (Python 3.11)
+├── requirements.txt            # Dependências Python
 ├── README.md                   # Este ficheiro
 ├── .gitignore
 ├── cassandra/
@@ -37,17 +39,20 @@ projeto_docker/
 │   └── init-s3.sh             # Buckets S3 criados automaticamente ao arrancar
 ├── grafana/
 │   └── provisioning/
-│       └── datasources/
-│           └── influxdb.yml   # Datasource InfluxDB pré-configurado
-├── notebooks/                  # Montado no Jupyter (/home/jovyan/work)
+│       ├── datasources/
+│       │   └── influxdb.yml   # Datasource InfluxDB pré-configurado
+│       └── dashboards/
+│           └── grafana_dashboard_pipeline.json
+├── notebooks/                  # Montado no Jupyter e usado pelos containers
 │   ├── 01_data_quality.ipynb
-│   ├── producer_sensores.py
-│   └── producer_apis_reais.py
-├── producers/                  # Producers Python (ver secção abaixo)
-│   ├── producer_sensores.py
-│   └── producer_apis_reais.py
+│   ├── producer_sensores.py        # Producer de dados simulados (mock)
+│   ├── producer_apis_reais.py      # Producer de APIs reais (NASA/IPMA/ICNF)
+│   ├── consumer_kafka_cassandra.py # Consumer Kafka -> validação -> Cassandra
+│   ├── data_quality.py             # Envio de métricas para InfluxDB
+│   └── data_quality_validation.py  # Validação Great Expectations
 └── spark/
-    └── jobs/                  # Scripts Spark Structured Streaming
+    └── jobs/
+        └── spark_streaming_agregacao.py  # Spark Structured Streaming
 ```
 
 ---
@@ -62,11 +67,14 @@ docker compose up -d
 docker compose ps
 
 # Ver logs em tempo real de um serviço específico
-docker compose logs -f jupyter
+docker compose logs -f spark-streaming
 ```
 
 A primeira vez demora 3–5 minutos (download das imagens + healthchecks).  
 O Cassandra é o serviço mais lento a ficar pronto (~90 segundos).
+
+A pipeline completa arranca com um único comando: producer, consumer e Spark
+Streaming começam a trabalhar automaticamente, sem intervenção manual.
 
 ---
 
@@ -84,6 +92,16 @@ O Cassandra é o serviço mais lento a ficar pronto (~90 segundos).
 
 ---
 
+## Componentes da pipeline
+
+| Serviço | Função | Arranque |
+|---|---|---|
+| `producer` | Gera leituras de sensores e publica no Kafka | Automático |
+| `consumer` | Lê do Kafka, valida e grava no Cassandra + InfluxDB | Automático |
+| `spark-streaming` | Agrega risco por zona em janelas de 10 min | Automático |
+
+---
+
 ## Ligar ao Cassandra
 
 ```bash
@@ -94,23 +112,27 @@ docker exec -it cassandra cqlsh
 USE forest_risk;
 DESCRIBE TABLES;
 SELECT * FROM fire_alerts LIMIT 10;
+SELECT COUNT(*) FROM sensor_readings;
 ```
 
 ---
 
-## Correr os producers
+## Producers — dados simulados vs reais
 
-Os producers publicam dados nos topics Kafka em tempo real.  
-Podem correr diretamente no host (com Python instalado) ou dentro do Jupyter.
+O projeto tem dois producers. Por omissão corre o de dados simulados
+(definido no `docker-compose.yml`). Para usar APIs reais, troca o comando
+do serviço `producer`:
 
-```bash
-# No host — requer: pip install kafka-python requests
-python producers/producer_sensores.py
-python producers/producer_apis_reais.py
+```yaml
+# Dados simulados (omissão)
+command: python notebooks/producer_sensores.py
 
-# Ou dentro do Jupyter (terminal integrado):
-# Os packages já estão instalados na imagem
+# Dados reais (requer NASA FIRMS API key)
+#command: python notebooks/producer_apis_reais.py
 ```
+
+O producer de APIs reais necessita de uma key gratuita da NASA FIRMS:
+https://firms.modaps.eosdis.nasa.gov/api/area/
 
 ---
 
@@ -118,11 +140,23 @@ python producers/producer_apis_reais.py
 
 | Topic | Partições | Retenção | Conteúdo |
 |---|---|---|---|
-| `sensor-events` | 3 | 7 dias | Leituras IoT simuladas (temp, humidade, vento) |
+| `sensor-events` | 3 | 7 dias | Leituras IoT (temp, humidade, vento) |
 | `satellite-hotspots` | 3 | 7 dias | Hotspots NASA FIRMS |
 | `weather-data` | 3 | 7 dias | Dados IPMA |
 | `fire-alerts` | 1 | 30 dias | Alertas gerados pelo motor de risco |
-| `data-quality-metrics` | 1 | 7 dias | Métricas de qualidade dos dados |
+| `data-quality-metrics` | 1 | 7 dias | Eventos rejeitados na validação |
+
+---
+
+## Processamento Spark Structured Streaming
+
+O serviço `spark-streaming` lê o topic `sensor-events` e calcula, para cada
+zona geográfica, médias de risco numa janela deslizante de 10 minutos
+(slide de 5 min, watermark de 2 min). Os resultados são impressos no log:
+
+```bash
+docker compose logs -f spark-streaming
+```
 
 ---
 
@@ -147,13 +181,14 @@ docker compose restart cassandra
 ```
 
 **Porta já em uso**  
-Verifica se tens outro serviço nas portas 8080, 8086, 8888, 9042 ou 29092:
-```bash
-lsof -i :8080
-```
+Verifica se tens outro serviço nas portas 8080, 8086, 8888, 9042 ou 29092.
 
 **Jupyter não arranca**  
 O Jupyter instala packages ao iniciar — aguarda 1–2 minutos e refresca.
+
+**Spark streaming demora a mostrar dados**  
+Na primeira execução descarrega o conector Kafka (~1 min). As janelas de
+10 min também precisam de acumular eventos antes de mostrar agregações.
 
 ---
 
