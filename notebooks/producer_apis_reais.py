@@ -47,7 +47,7 @@ from kafka import KafkaProducer
 
 # TODO: Cola aqui a tua API key da NASA FIRMS
 # Obténs em: https://firms.modaps.eosdis.nasa.gov/api/area/
-NASA_FIRMS_KEY = "COLOCA_AQUI_A_TUA_KEY_NASA"
+NASA_FIRMS_KEY = "579b22bcae291064c381d64a3375f069"
 
 # Kafka — muda para "kafka:9092" se correres dentro do Jupyter/Docker
 KAFKA_BOOTSTRAP = "localhost:29092"
@@ -115,7 +115,7 @@ def fetch_nasa_firms():
           Vai ao link acima e gera uma nova.
     TODO: Se quiseres mais precisão, muda NASA_DAYS para 3 ou 7.
     """
-    if NASA_FIRMS_KEY == "COLOCA_AQUI_A_TUA_KEY_NASA":
+    if NASA_FIRMS_KEY == "579b22bcae291064c381d64a3375f069":
         log.warning("⚠️  NASA FIRMS key não configurada — a saltar fetch de hotspots")
         return []
 

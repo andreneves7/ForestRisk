@@ -19,13 +19,16 @@ TECNOLOGIA: Apache Spark Structured Streaming (UC Big Data Tools II)
     - watermark de 2 min (tolera eventos atrasados)
     - agregação por grid_id
 
-COMO CORRER (dentro do Jupyter, que já tem Spark 3.5):
-    Abre um terminal no Jupyter Lab e corre:
-        spark-submit \
-          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
-          /home/jovyan/work/spark_streaming_agregacao.py
+ESCREVE EM DOIS DESTINOS:
+    A) Console → tabelas em tempo real (demonstração)
+    B) S3      → Parquet no data lake (arquivo de longo prazo)
 
-    Ou copia o código para uma célula de notebook e corre.
+COMO CORRER (dentro do Jupyter, que já tem Spark 3.5):
+    Abre um terminal no Jupyter Lab e corre.
+    NOTA: agora são precisos DOIS packages (Kafka + S3/hadoop-aws):
+        spark-submit \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4 \
+          /home/jovyan/spark-jobs/spark_streaming_agregacao.py
 ================================================================================
 """
 
@@ -170,13 +173,34 @@ df_saida = df_agregado.select(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. ESCREVER O RESULTADO (writeStream)
+# 6. ESCREVER O RESULTADO — DOIS DESTINOS EM SIMULTÂNEO
 # ══════════════════════════════════════════════════════════════════════════════
-# outputMode="update" → mostra apenas as janelas que mudaram desde o último batch
-# format="console"    → imprime no terminal (ideal para demonstração)
-# trigger 30s         → processa um micro-batch a cada 30 segundos
+# O mesmo stream agregado é escrito para dois sítios ao mesmo tempo:
+#   A) Console  → para demonstração ao vivo (vês as tabelas no terminal)
+#   B) S3       → para arquivo no data lake (Parquet, análise posterior)
 
-query = (
+# ── Configuração S3 (endpoint configurável: LocalStack ou AWS real) ───────────
+S3_BUCKET = "forest-risk-datalake"
+S3_PATH = f"s3a://{S3_BUCKET}/agregados_streaming/"
+S3_CHECKPOINT = f"s3a://{S3_BUCKET}/checkpoints/agregados/"
+
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL", "http://localstack:4566")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "test")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
+
+# Configura o Spark para falar com o S3 (via protocolo s3a)
+hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+hadoop_conf.set("fs.s3a.endpoint", AWS_ENDPOINT_URL)
+hadoop_conf.set("fs.s3a.access.key", AWS_ACCESS_KEY)
+hadoop_conf.set("fs.s3a.secret.key", AWS_SECRET_KEY)
+hadoop_conf.set("fs.s3a.path.style.access", "true")          # necessário para LocalStack
+hadoop_conf.set("fs.s3a.connection.ssl.enabled", "false")    # LocalStack usa http
+hadoop_conf.set("fs.s3a.aws.credentials.provider",
+                "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+
+# ── Destino A: Console (demonstração) ─────────────────────────────────────────
+# outputMode="update" → mostra só as janelas que mudaram
+query_console = (
     df_saida.writeStream
     .outputMode("update")
     .format("console")
@@ -186,7 +210,23 @@ query = (
     .start()
 )
 
+# ── Destino B: S3 em Parquet (arquivo) ────────────────────────────────────────
+# outputMode="append" → grava janelas já fechadas (obrigatório para ficheiros)
+# O checkpoint guarda o progresso para não reprocessar/duplicar em reinícios.
+query_s3 = (
+    df_saida.writeStream
+    .outputMode("append")
+    .format("parquet")
+    .option("path", S3_PATH)
+    .option("checkpointLocation", S3_CHECKPOINT)
+    .trigger(processingTime="30 seconds")
+    .start()
+)
+
 print("Streaming iniciado! A agregar risco por zona em janelas de 10 min.")
+print(f"  Destino A: console (demonstracao)")
+print(f"  Destino B: {S3_PATH} (arquivo Parquet)")
 print("Pressiona Ctrl+C para parar.\n")
 
-query.awaitTermination()
+# Aguarda ambos os streams
+spark.streams.awaitAnyTermination()
