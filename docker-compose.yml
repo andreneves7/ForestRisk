@@ -261,10 +261,9 @@ services:
       - INFLUXDB_ORG=forest-risk
       - INFLUXDB_BUCKET=metrics
 
-  # ─── Spark Structured Streaming (agregação de risco por zona) ────────────────
+# ─── Spark Structured Streaming (agregação de risco por zona → console + S3) ─
   # Arranca automaticamente como o producer e o consumer.
-  # Usa a imagem pyspark-notebook (que já tem Spark 3.5) em vez do Dockerfile,
-  # porque o Dockerfile (python:3.11-slim) NAO tem Spark instalado.
+  # Agora precisa de DOIS packages: Kafka (ler stream) + hadoop-aws (escrever S3).
   spark-streaming:
     image: quay.io/jupyter/pyspark-notebook:spark-3.5.0
     container_name: spark-streaming
@@ -275,6 +274,10 @@ services:
         condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: eu-west-1
     volumes:
       - ./spark/jobs:/home/jovyan/spark-jobs
     command: >
@@ -282,9 +285,8 @@ services:
         echo 'A aguardar Kafka estabilizar...' &&
         sleep 25 &&
         echo 'A arrancar Spark Structured Streaming...' &&
-        spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 /home/jovyan/spark-jobs/spark_streaming_agregacao.py
+        spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4 /home/jovyan/spark-jobs/spark_streaming_agregacao.py
       "
-
 # ─── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
   kafka_data:
