@@ -220,6 +220,7 @@ services:
       AWS_DEFAULT_REGION: eu-west-1
     volumes:
       - ./notebooks:/home/jovyan/work
+      - ./spark/jobs:/home/jovyan/spark-jobs
       - jupyter_data:/home/jovyan/.jupyter
     command: >
       bash -c "
@@ -259,6 +260,30 @@ services:
       - INFLUXDB_TOKEN=forest-risk-influx-token-2024
       - INFLUXDB_ORG=forest-risk
       - INFLUXDB_BUCKET=metrics
+
+  # ─── Spark Structured Streaming (agregação de risco por zona) ────────────────
+  # Arranca automaticamente como o producer e o consumer.
+  # Usa a imagem pyspark-notebook (que já tem Spark 3.5) em vez do Dockerfile,
+  # porque o Dockerfile (python:3.11-slim) NAO tem Spark instalado.
+  spark-streaming:
+    image: quay.io/jupyter/pyspark-notebook:spark-3.5.0
+    container_name: spark-streaming
+    restart: unless-stopped
+    user: root
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+    volumes:
+      - ./spark/jobs:/home/jovyan/spark-jobs
+    command: >
+      bash -c "
+        echo 'A aguardar Kafka estabilizar...' &&
+        sleep 25 &&
+        echo 'A arrancar Spark Structured Streaming...' &&
+        spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 /home/jovyan/spark-jobs/spark_streaming_agregacao.py
+      "
 
 # ─── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
