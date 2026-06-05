@@ -33,6 +33,8 @@ notebooks/.ipynb_checkpoints/
 *.csv
 *.h5
 *.hdf5
+# Mock/fixture data committed intentionally for Athena schema validation
+!data/mock/*.csv
 spark/jobs/__pycache__/
 
 # ─── Credenciais e segredos ───────────────────────────────────────────────────
@@ -58,3 +60,4 @@ logs/
 
 # ─── Grafana (gerado automaticamente, não editar manualmente) ─────────────────
 grafana/data/
+.superpowers/
