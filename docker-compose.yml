@@ -141,20 +141,47 @@ services:
       - localstack_data:/var/lib/localstack
       - ./localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh
 
+  # ─── Carga histórica NASA FIRMS (corre uma vez ao arrancar) ──────────────────
+  carga-historico:
+    image: quay.io/jupyter/pyspark-notebook:spark-3.5.0
+    container_name: carga-historico
+    restart: "no"
+    user: root
+    depends_on:
+      - localstack
+    environment:
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: eu-west-1
+      CSV_DIR: /home/jovyan/work/data
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./localstack/check_and_load.sh:/check_and_load.sh
+    command: >
+      bash -c "
+        echo 'A aguardar LocalStack inicializar...' &&
+        sleep 15 &&
+        pip install --quiet s3fs pyarrow pandas boto3 &&
+        bash /check_and_load.sh
+      "
+
   # ─── InfluxDB ─────────────────────────────────────────────────────────────────
   influxdb:
     image: influxdb:2.7
     container_name: influxdb
     restart: unless-stopped
+    env_file:
+      - .env
     ports:
       - "8086:8086"
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: forestrisk123
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD}
       DOCKER_INFLUXDB_INIT_ORG: forest-risk
       DOCKER_INFLUXDB_INIT_BUCKET: metrics
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: forest-risk-influx-token-2024
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
     volumes:
       - influxdb_data:/var/lib/influxdb2
       - influxdb_config:/etc/influxdb2
@@ -172,11 +199,13 @@ services:
     depends_on:
       influxdb:
         condition: service_healthy
+    env_file:
+      - .env
     ports:
       - "3000:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: forestrisk123
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_PATHS_PROVISIONING: /etc/grafana/provisioning
     volumes:
@@ -194,6 +223,8 @@ services:
     container_name: jupyter
     restart: unless-stopped
     user: root
+    env_file:
+      - .env
     depends_on:
       kafka:
         condition: service_healthy
@@ -211,7 +242,7 @@ services:
       CASSANDRA_PORT: "9042"
       KAFKA_BOOTSTRAP: kafka:9092
       INFLUXDB_URL: http://influxdb:8086
-      INFLUXDB_TOKEN: forest-risk-influx-token-2024
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
       INFLUXDB_ORG: forest-risk
       INFLUXDB_BUCKET: metrics
       AWS_ENDPOINT_URL: http://localstack:4566
@@ -228,15 +259,32 @@ services:
         jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --ServerApp.token='forestrisk' --ServerApp.password='' --allow-root
       "
 
-  # ─── Producer ─────────────────────────────────────────────────────────────────
-  producer:
+  # ─── Producer sensores IoT simulados ─────────────────────────────────────────
+  # Alimenta o topic: sensor-events (temperatura, humidade, vento simulados)
+  producer-sensores:
     build: .
-    container_name: producer
+    container_name: producer-sensores
     command: python notebooks/producer_sensores.py
     depends_on:
       kafka:
         condition: service_healthy
     restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+
+  # ─── Producer APIs reais (NASA FIRMS + IPMA + ICNF) ──────────────────────────
+  # Alimenta os topics: satellite-hotspots, weather-data, sensor-events
+  # Requer NASA_FIRMS_KEY no ficheiro .env
+  producer-apis:
+    build: .
+    container_name: producer-apis
+    command: python notebooks/producer_apis_reais.py
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - KAFKA_BOOTSTRAP=kafka:9092
 
@@ -253,17 +301,17 @@ services:
       influxdb:
         condition: service_healthy
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - KAFKA_BOOTSTRAP=kafka:9092
       - CASSANDRA_HOST=cassandra
       - INFLUXDB_URL=http://influxdb:8086
-      - INFLUXDB_TOKEN=forest-risk-influx-token-2024
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
       - INFLUXDB_ORG=forest-risk
       - INFLUXDB_BUCKET=metrics
 
-# ─── Spark Structured Streaming (agregação de risco por zona → console + S3) ─
-  # Arranca automaticamente como o producer e o consumer.
-  # Agora precisa de DOIS packages: Kafka (ler stream) + hadoop-aws (escrever S3).
+  # ─── Spark Structured Streaming (agregação de risco por zona → console + S3) ─
   spark-streaming:
     image: quay.io/jupyter/pyspark-notebook:spark-3.5.0
     container_name: spark-streaming
@@ -287,6 +335,7 @@ services:
         echo 'A arrancar Spark Structured Streaming...' &&
         spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4 /home/jovyan/spark-jobs/spark_streaming_agregacao.py
       "
+
 # ─── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
   kafka_data:
