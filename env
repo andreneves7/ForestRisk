@@ -1,0 +1,12 @@
+# ─── Credenciais — NUNCA fazer commit deste ficheiro ─────────────────────────
+
+# NASA FIRMS API key
+# Obtém em: https://firms.modaps.eosdis.nasa.gov/api/area/
+NASA_FIRMS_KEY=579b22bcae291064c381d64a3375f069
+
+# InfluxDB
+INFLUXDB_PASSWORD=forestrisk123
+INFLUXDB_TOKEN=forest-risk-influx-token-2024
+
+# Grafana
+GRAFANA_PASSWORD=forestrisk123
