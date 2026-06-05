@@ -1,7 +1,20 @@
+"""
+Generate mock ML predictions for Portuguese forest risk regions and upload to S3.
+
+Usage (from project root):
+    python scripts/generate_mock_predictions.py
+
+Required env vars:
+    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (default: eu-west-1)
+
+Output:
+    data/mock/mock_predictions.csv  (50 rows, seeded at 42)
+    s3://forest-risk-datalake/mock/mock_predictions.csv
+"""
+
 import csv
 import os
 import random
-from datetime import date
 
 import boto3
 
@@ -33,41 +46,48 @@ REGIOES = [
     ("PT-MNH-001", "Minho Norte"), ("PT-MNH-002", "Minho Sul"),
 ]
 
-random.seed(42)
-today = date.today().isoformat()
+FIELDNAMES = ["grid_id", "regiao", "predicted_risk_score", "confidence", "prediction_date", "model_version"]
 
-rows = []
-for grid_id, regiao in REGIOES:
-    risk = round(random.uniform(5, 98), 1)
-    confidence = round(random.uniform(60, 95), 1)
-    rows.append({
-        "grid_id": grid_id,
-        "regiao": regiao,
-        "predicted_risk_score": risk,
-        "confidence": confidence,
-        "prediction_date": today,
-        "model_version": "v0.1-mock",
-    })
+if __name__ == "__main__":
+    prediction_date = "2026-06-05"  # fixture date — matches committed CSV
 
-os.makedirs("data/mock", exist_ok=True)
-csv_path = "data/mock/mock_predictions.csv"
+    random.seed(42)
 
-with open(csv_path, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
+    rows = []
+    for grid_id, regiao in REGIOES:
+        risk = round(random.uniform(5, 98), 1)
+        confidence = round(random.uniform(60, 95), 1)
+        rows.append({
+            "grid_id": grid_id,
+            "regiao": regiao,
+            "predicted_risk_score": risk,
+            "confidence": confidence,
+            "prediction_date": prediction_date,
+            "model_version": "v0.1-mock",
+        })
 
-print(f"CSV gerado: {csv_path} ({len(rows)} linhas)")
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+    csv_path = os.path.join(PROJECT_ROOT, "data", "mock", "mock_predictions.csv")
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
 
-# Upload to S3
-bucket = "forest-risk-datalake"
-s3_key = "mock/mock_predictions.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
 
-s3 = boto3.client(
-    "s3",
-    region_name=os.getenv("AWS_DEFAULT_REGION", "eu-west-1"),
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-)
-s3.upload_file(csv_path, bucket, s3_key)
-print(f"Uploaded to s3://{bucket}/{s3_key}")
+    print(f"CSV gerado: {csv_path} ({len(rows)} linhas)")
+
+    # Upload to S3
+    bucket = "forest-risk-datalake"
+    s3_key = "mock/mock_predictions.csv"
+
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION", "eu-west-1"))
+
+    try:
+        s3.upload_file(csv_path, bucket, s3_key)
+        print(f"Uploaded to s3://{bucket}/{s3_key}")
+    except Exception as exc:
+        print(f"S3 upload failed: {exc}")
+        print(f"Local CSV is still available at: {csv_path}")
+        raise SystemExit(1)
