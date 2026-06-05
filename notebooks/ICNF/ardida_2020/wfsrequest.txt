@@ -1,1 +1,0 @@
-http://si.icnf.pt/geoserverplinia/BDG/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=BDG%3Aardida_2020&outputFormat=SHAPE-ZIP
