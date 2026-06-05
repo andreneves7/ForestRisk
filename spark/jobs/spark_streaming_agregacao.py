@@ -184,19 +184,21 @@ S3_BUCKET = "forest-risk-datalake"
 S3_PATH = f"s3a://{S3_BUCKET}/agregados_streaming/"
 S3_CHECKPOINT = f"s3a://{S3_BUCKET}/checkpoints/agregados/"
 
-AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL", "http://localstack:4566")
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "test")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")  # None = real AWS
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 # Configura o Spark para falar com o S3 (via protocolo s3a)
 hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
-hadoop_conf.set("fs.s3a.endpoint", AWS_ENDPOINT_URL)
 hadoop_conf.set("fs.s3a.access.key", AWS_ACCESS_KEY)
 hadoop_conf.set("fs.s3a.secret.key", AWS_SECRET_KEY)
-hadoop_conf.set("fs.s3a.path.style.access", "true")          # necessário para LocalStack
-hadoop_conf.set("fs.s3a.connection.ssl.enabled", "false")    # LocalStack usa http
 hadoop_conf.set("fs.s3a.aws.credentials.provider",
                 "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+if AWS_ENDPOINT_URL:
+    # LocalStack ou outro endpoint local
+    hadoop_conf.set("fs.s3a.endpoint", AWS_ENDPOINT_URL)
+    hadoop_conf.set("fs.s3a.path.style.access", "true")
+    hadoop_conf.set("fs.s3a.connection.ssl.enabled", "false")
 
 # ── Destino A: Console (demonstração) ─────────────────────────────────────────
 # outputMode="update" → mostra só as janelas que mudaram
