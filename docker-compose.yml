@@ -127,26 +127,6 @@ services:
         echo 'Schema aplicado!'
       "
 
-  # ─── LocalStack (AWS S3 local) ────────────────────────────────────────────────
-  localstack:
-    image: localstack/localstack:3.0
-    container_name: localstack
-    restart: unless-stopped
-    ports:
-      - "4566:4566"
-    environment:
-      SERVICES: s3
-      PERSISTENCE: 1
-    volumes:
-      - localstack_data:/var/lib/localstack
-      - ./localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh
-    healthcheck:
-      test: ["CMD", "awslocal", "s3", "ls", "s3://forest-risk-models"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
   # ─── InfluxDB ─────────────────────────────────────────────────────────────────
   influxdb:
     image: influxdb:2.7
@@ -222,10 +202,9 @@ services:
       INFLUXDB_TOKEN: forest-risk-influx-token-2024
       INFLUXDB_ORG: forest-risk
       INFLUXDB_BUCKET: metrics
-      AWS_ENDPOINT_URL: http://localstack:4566
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: eu-west-1
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-1}
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
       - ./notebooks:/home/jovyan/work
@@ -277,12 +256,9 @@ services:
     ports:
       - "5000:5000"
     environment:
-      AWS_ENDPOINT_URL: http://localstack:4566
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: eu-west-1
-      # Overrides boto3 endpoint specifically for MLflow's artifact store S3 client
-      MLFLOW_S3_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-1}
     command: >
       mlflow server
       --host 0.0.0.0
@@ -291,9 +267,6 @@ services:
       --default-artifact-root s3://forest-risk-models/mlflow
     volumes:
       - mlflow_data:/mlflow
-    depends_on:
-      localstack:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
       interval: 10s
@@ -305,7 +278,6 @@ services:
 volumes:
   kafka_data:
   cassandra_data:
-  localstack_data:
   influxdb_data:
   influxdb_config:
   grafana_data:
