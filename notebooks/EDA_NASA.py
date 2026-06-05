@@ -476,17 +476,7 @@ def gerar_html(m, graficos, descritivas_html, ficheiros_input):
   <h2>Visualizações</h2>
   {graficos_html}
 
-  <h2>Próximo passo: Feature Engineering</h2>
-  <div class="resumo-box">
-    <ul>
-      <li>Criar grid <strong>5×5 km</strong> para Portugal Continental</li>
-      <li>Agregar hotspots por célula do grid: contagem, FRP médio, FRP máximo</li>
-      <li>Adicionar features temporais: mês, estação do ano, dia da semana</li>
-      <li>Calcular médias móveis de FRP (7 dias, 30 dias)</li>
-      <li>Guardar dataset final em <code>firms_features.csv</code> → S3/MinIO para treino do modelo</li>
-    </ul>
-  </div>
-
+ 
 </div>
 <div class="footer">ForestRisk · ISEP 2024/2025 · Pessoa B — Data Scientist · {now}</div>
 </body>

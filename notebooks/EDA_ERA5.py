@@ -507,17 +507,7 @@ def gerar_html(m, graficos, stats_html):
 <h2>Visualizações</h2>
 {graficos_html}
 
-<h2>Próximo passo: juntar com FIRMS</h2>
-<div class="box"><ul>
-  <li>Join espacial-temporal entre ERA5 e FIRMS por coordenada (grid 5×5 km) e data</li>
-  <li>Calcular índice de risco composto 0–100 por célula de grid</li>
-  <li>Usar variáveis ERA5 (<code>temp_c</code>, <code>rh</code>, <code>wind_speed_kmh</code>) como features no Random Forest + XGBoost</li>
-</ul></div>
 
-</div>
-<div class="footer">ForestRisk · ISEP 2024/2025 · ERA5 Copernicus · {now}</div>
-</body>
-</html>'''
 
 # ─────────────────────────────────────────────
 # MAIN
