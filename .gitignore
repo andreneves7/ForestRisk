@@ -35,7 +35,8 @@ notebooks/.ipynb_checkpoints/
 *.dbf
 *.prj
 *.shx
-*wfsrequesst.txt
+*.shp
+*wfsrequest.txt
 *.h5
 *.hdf5
 spark/jobs/__pycache__/
