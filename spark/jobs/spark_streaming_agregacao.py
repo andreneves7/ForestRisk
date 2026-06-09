@@ -58,6 +58,12 @@ S3_CHECKPOINT = f"s3a://{S3_BUCKET}/checkpoints/agregados_join/"
 # 1. SESSAO SPARK
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Criação da sessão Spark ──────────────────────────────────────────────────
+# local[*] = usa todos os CPU cores disponíveis no container
+# shuffle.partitions=4: default é 200 (pensado para clusters grandes)
+#   com 4, cada shuffle (join, groupBy) cria só 4 partições — mais leve em local
+# statefulOperator.checkCorrectness=false: permite left join em streams com
+#   watermark, que o Spark por defeito proíbe (considera semanticamente incerto)
 spark = (
     SparkSession.builder
     .appName("ForestRisk-StreamingJoin3")
@@ -70,7 +76,11 @@ spark = (
 )
 spark.sparkContext.setLogLevel("WARN")
 
-# Configura S3
+# ── Configuração S3 (via protocolo s3a do Hadoop) ────────────────────────────
+# O Spark usa o cliente Hadoop S3A para escrever no S3.
+# path.style.access=true: obrigatório para LocalStack (usa /bucket/key)
+#   em vez do estilo AWS (bucket.s3.amazonaws.com/key)
+# connection.ssl.enabled=false: LocalStack usa HTTP, não HTTPS
 hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
 hadoop_conf.set("fs.s3a.endpoint", AWS_ENDPOINT_URL)
 hadoop_conf.set("fs.s3a.access.key", AWS_ACCESS_KEY)
@@ -86,6 +96,11 @@ print(f"Sessao Spark criada. Kafka: {KAFKA_BOOTSTRAP}")
 # 2. SCHEMAS DOS 3 TOPICS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Schemas dos 3 topics ──────────────────────────────────────────────────────
+# O Kafka entrega bytes brutos. O Spark precisa do schema para parsear o JSON.
+# Campos não declarados são ignorados. Tipos incorretos resultam em null.
+# StructField(nome, tipo, nullable=True por defeito)
+#
 # Schema do topic sensor-events (producer_sensores.py + producer_apis_reais.py)
 schema_sensores = StructType([
     StructField("grid_id",       StringType()),
@@ -133,7 +148,18 @@ schema_meteo = StructType([
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ler_topic(topic, schema, timestamp_col="timestamp"):
-    """Le um topic do Kafka, parseia o JSON e converte o timestamp."""
+    """
+    Cria um stream contínuo a partir de um topic Kafka.
+
+    Transformação em 4 passos:
+    1. .load()              → DataFrame de streaming com colunas Kafka (key, value, offset...)
+    2. selectExpr CAST      → coluna value (bytes) → string JSON
+    3. from_json()          → string JSON → struct com o schema definido
+    4. withColumn event_time → timestamp ISO string → tipo Timestamp do Spark
+
+    startingOffsets="latest": ao arrancar, começa a ler mensagens novas.
+    Usar "earliest" releria todo o histórico do topic.
+    """
     return (
         spark.readStream
         .format("kafka")
@@ -158,6 +184,18 @@ stream_meteo    = ler_topic("weather-data",        schema_meteo)
 # O watermark de 2 min tolera eventos atrasados.
 # Depois os 3 agregados sao joined por (janela, grid_id).
 
+# ── Agregação com Sliding Window ──────────────────────────────────────────────
+# Cada stream é agregado independentemente antes do join.
+# withWatermark("event_time", "2 minutes"):
+#   Diz ao Spark para esperar até 2 min por eventos atrasados.
+#   Eventos com mais de 2 min de atraso são descartados (janela já fechou).
+#   Sem watermark, o Spark manteria estado para sempre → memória infinita.
+#
+# window("event_time", "10 minutes", "5 minutes"):
+#   Janela de 10 min que desliza de 5 em 5 min (sliding window).
+#   Um evento às 19:07 pertence a DUAS janelas: 19:00-19:10 e 19:05-19:15.
+#   Resultado: médias recalculadas a cada 5 min com dados dos últimos 10 min.
+#
 # ── Agregacao dos sensores IoT ────────────────────────────────────────────────
 agg_sensores = (
     stream_sensores
@@ -211,6 +249,12 @@ agg_meteo = (
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. JOIN DOS 3 STREAMS
 # ══════════════════════════════════════════════════════════════════════════════
+# ── Left Join ─────────────────────────────────────────────────────────────────
+# "left" join: mantém TODAS as linhas de agg_sensores mesmo que não haja
+# correspondência em agg_satelite ou agg_meteo para aquela (janela, grid_id).
+# Sem hotspots numa zona → n_hotspots=null → tratado com coalesce() abaixo.
+# "inner" join excluiria zonas sem dados NASA — perderia informação de risco.
+#
 # outer join: garante que aparece resultado mesmo que um stream nao tenha dados
 # numa determinada janela/zona (ex: sem hotspots de satelite numa zona)
 
@@ -256,6 +300,16 @@ df_resultado = joined.select(
     col("vento_max_ipma"),
     col("precipitacao_media"),
 
+    # ── Índice de Risco Composto ─────────────────────────────────────────────
+    # Combina as 3 fontes numa única métrica 0-100.
+    # coalesce(col, lit(0)): substitui null por 0 quando um stream não tinha
+    #   dados para aquela janela/zona (resultado do left join).
+    # FRP normalizado: divide por 200 (MW máximo realista) e multiplica por 100
+    #   para trazer para a mesma escala do risk_score (0-100).
+    # Pesos justificados:
+    #   60% sensores IoT — maior resolução temporal, mais dados contínuos
+    #   25% FRP NASA     — indicador mais fiável de incêndio activo real
+    #   15% vento IPMA   — factor meteorológico mais crítico para propagação
     # Indice de risco composto (0-100):
     # 60% sensor + 25% FRP normalizado (max=200MW) + 15% vento IPMA
     (
@@ -269,6 +323,15 @@ df_resultado = joined.select(
 # 7. ESCREVER — CONSOLE + S3
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Destinos de Escrita ───────────────────────────────────────────────────────
+# outputMode="update" (console): mostra janelas que mudaram desde o último batch
+#   → ideal para demo ao vivo, vê-se updates em tempo real
+# outputMode="append"  (S3):     só grava janelas completamente fechadas
+#   → evita reescrever dados parciais no S3, garante dados finais
+# trigger(30s): processa um micro-batch a cada 30 segundos
+# checkpointLocation: o Spark grava aqui o progresso — se reiniciar,
+#   retoma do ponto onde ficou sem reprocessar eventos já tratados
+#
 # Destino A — Console (demonstracao ao vivo)
 query_console = (
     df_resultado.writeStream

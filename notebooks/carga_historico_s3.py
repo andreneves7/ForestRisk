@@ -74,7 +74,22 @@ def coords_para_grid(lat, lon):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ler_parquet_eda(pasta, prefixo, nome_eda):
-    """Le Parquet ja processado pela EDA. Retorna None se nao existir."""
+    """
+    Lê os ficheiros Parquet produzidos pelas EDAs da Pessoa B.
+    Devolve None (não levanta excepção) se a pasta não existir ou estiver
+    vazia — permite ao main() tentar o Modo 2 (CSV) sem falhar.
+
+    Estratégia de leitura:
+    1. Tenta o ficheiro combinado: firms_portugal_limpo_todos.parquet
+       (mais eficiente — um único ficheiro vs N ficheiros por ano)
+    2. Se não existir, lê ficheiros por ano e concatena:
+       firms_portugal_limpo_2020.parquet, _2021, _2022, ...
+
+    Parâmetros:
+        pasta     → caminho da pasta (ex: BASE_DIR / "Filtragem_Parquet")
+        prefixo   → prefixo do nome dos ficheiros (ex: "firms_portugal_limpo")
+        nome_eda  → nome da EDA para logs (ex: "EDA_NASA")
+    """
     pasta = Path(pasta)
     if not pasta.exists():
         return None
@@ -108,6 +123,20 @@ def ler_parquet_eda(pasta, prefixo, nome_eda):
 
 def ler_csv_como_eda(pasta):
     """
+    Lê os CSV brutos da NASA de NASACSV/ e replica EXACTAMENTE
+    o comportamento da EDA_NASA.py. Usado quando a EDA ainda não correu.
+
+    Decisões de design alinhadas com a EDA_NASA.py:
+    - Detecção do satélite pelo nome do ficheiro (snpp→S-NPP, jpss1→NOAA-20)
+    - Filtro por bounding box de Portugal (lat 36.9-42.2, lon -9.5–-6.2)
+    - NÃO remove confidence="l" (baixa) — a EDA também não remove
+    - Cria colunas ano/mes/dia a partir de acq_date
+    - Selecciona as mesmas colunas que a EDA produziria
+
+    Porquê [c for c in COLUNAS_EDA if c in df_pt.columns]:
+    Alguns CSV mais antigos podem não ter todas as colunas. Esta expressão
+    selecciona apenas as que existem, evitando KeyError.
+
     Le CSV de NASACSV/ e replica exactamente o que a EDA_NASA.py faz:
     - Le todos os CSV da pasta
     - Adiciona coluna 'satelite' com base no nome do ficheiro
@@ -173,7 +202,21 @@ def ler_csv_como_eda(pasta):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def adicionar_grid_id(df):
-    """Adiciona grid_id com base nas coordenadas. A EDA nao faz isto."""
+    """
+    Adiciona a coluna grid_id mapeando coordenadas GPS para a zona mais próxima.
+    A EDA_NASA.py NÃO calcula o grid_id — é um enriquecimento feito por este script.
+
+    Algoritmo: distância euclidiana aos 10 centroides das zonas de Portugal.
+    Não é a distância geográfica real (que usaria haversine) mas é suficiente
+    para a escala do Portugal Continental.
+
+    df.copy(): cria uma cópia antes de modificar para evitar
+    SettingWithCopyWarning do pandas (boa prática quando df vem de um slice).
+
+    O grid_id resultante é a chave que liga:
+    - hotspots/ (S3) ↔ agregados_streaming/ (S3) → join para modelo ML
+    - Cassandra sensor_readings ↔ Spark streaming → análise em tempo real
+    """
     if "grid_id" not in df.columns:
         print("  A mapear coordenadas -> grid_id...")
         df = df.copy()
@@ -184,6 +227,12 @@ def adicionar_grid_id(df):
 
 
 def preparar_era5(df):
+    """
+    Garante que o DataFrame ERA5 tem as colunas ano e mes para particionamento.
+    A EDA_ERA5.py já as cria normalmente, mas esta função é um safety net
+    para o caso de versões mais antigas da EDA não as incluírem.
+    ERA5 não tem grid_id — é particionado só por ano/mes (cobertura nacional).
+    """
     df = df.copy()
     if "ano" not in df.columns and "time" in df.columns:
         dt = pd.to_datetime(df["time"])
@@ -198,6 +247,20 @@ def preparar_era5(df):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def storage_options():
+    """
+    Devolve as opções de ligação ao S3 para o pandas/pyarrow.
+    Endpoint configurável: LocalStack em dev, AWS real em produção.
+
+    Como funciona o endpoint configurável:
+    - Se AWS_ENDPOINT_URL está definido (ex: http://localstack:4566)
+      → pandas usa o LocalStack local em vez da AWS
+    - Se AWS_ENDPOINT_URL é None (não definido no ambiente)
+      → pandas vai directamente para o S3 real da AWS
+    O mesmo código funciona nos dois ambientes sem alterações.
+
+    Para migrar para AWS real: remover AWS_ENDPOINT_URL do .env
+    e definir credenciais AWS reais (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY).
+    """
     opts = {
         "key":    os.getenv("AWS_ACCESS_KEY_ID", "test"),
         "secret": os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
@@ -212,6 +275,21 @@ def storage_options():
 
 
 def gravar_s3(df, prefixo, partition_cols):
+    """
+    Grava o DataFrame no S3 em formato Parquet particionado.
+
+    partition_cols=["ano","mes","grid_id"] diz ao pandas/pyarrow para
+    NÃO incluir estas colunas dentro do ficheiro Parquet. Em vez disso,
+    cria sub-pastas: ano=2020/mes=8/grid_id=PT-NORTE-01/dados.parquet
+
+    Vantagem do particionamento:
+    Quando a Pessoa B ler os dados para treinar o modelo, pode pedir
+    só o verão de 2022 no Norte → Spark lê só as pastas relevantes
+    em vez de carregar todos os 52k registos.
+    Exemplo: spark.read.parquet(".../hotspots/ano=2022/mes=8/grid_id=PT-NORTE-02/")
+
+    index=False: não grava o índice pandas (0,1,2...) como coluna — é irrelevante.
+    """
     caminho = f"s3://{BUCKET}/{prefixo}/"
     df.to_parquet(caminho, engine="pyarrow",
                   partition_cols=partition_cols,
@@ -220,6 +298,11 @@ def gravar_s3(df, prefixo, partition_cols):
 
 
 def verificar_s3(prefixo):
+    """
+    Lista os primeiros ficheiros Parquet no S3 para confirmar a carga.
+    Usa boto3 directamente (não pandas) para uma listagem rápida sem
+    descarregar os dados. Mostra só os primeiros 5 para não sobrecarregar o log.
+    """
     s3 = boto3.client("s3", endpoint_url=AWS_ENDPOINT_URL,
                       region_name=AWS_REGION,
                       aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID","test"),
