@@ -33,6 +33,7 @@ COMO CORRER:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
+import os
 import json
 import time
 import logging
@@ -50,7 +51,7 @@ from kafka import KafkaProducer
 NASA_FIRMS_KEY = os.getenv("NASA_FIRMS_KEY", "")
 
 # Kafka — muda para "kafka:9092" se correres dentro do Jupyter/Docker
-KAFKA_BOOTSTRAP = "localhost:29092"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 
 # Bounding box de Portugal Continental (esquerda, baixo, direita, cima)
 # Não precisas de alterar, cobre todo o território continental
@@ -470,6 +471,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
-cp /home/claude/producer_apis_reais.py /mnt/user-data/outputs/producer_apis_reais.py
-echo "OK"
