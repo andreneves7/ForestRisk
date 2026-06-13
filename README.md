@@ -63,7 +63,7 @@ projeto_docker/
 │   └── init.cql                   # Schema criado automaticamente ao arrancar
 ├── localstack/
 │   ├── init-s3.sh                 # Buckets S3 criados automaticamente
-│   └── check_and_load.sh          # Verifica S3 e carrega histórico se vazio
+│   └── check_and_load.sh          # Verifica Parquet EDAs vs S3 e carrega se necessário
 ├── grafana/
 │   └── provisioning/
 │       ├── datasources/
@@ -129,7 +129,7 @@ o consumer e o Spark Streaming começam automaticamente, sem intervenção manua
 | `producer-apis` | Consulta NASA FIRMS, IPMA, ICNF → topics reais | Automático |
 | `consumer` | Lê Kafka, valida, grava no Cassandra + InfluxDB + `fire-alerts` | Automático |
 | `spark-streaming` | Join 3 streams, calcula risco composto → console + S3 | Automático |
-| `carga-historico` | Carrega dados históricos NASA para o S3 (corre uma vez) | Automático |
+| `carga-historico` | Verifica Parquet das EDAs e carrega para o S3 se mais recentes | Automático |
 
 ---
 
@@ -178,19 +178,21 @@ docker compose logs -f spark-streaming
 
 ## Data Lake S3
 
-O data lake `forest-risk-datalake` é populado automaticamente:
+O data lake `forest-risk-datalake` é populado pelo `carga-historico` **quando as EDAs da Pessoa B tiverem corrido**:
 
 ```
 s3://forest-risk-datalake/
-├── hotspots/            ← NASA FIRMS histórico (2020-2024, ~52k registos)
+├── hotspots/            ← NASA FIRMS histórico (após EDA_NASA.py)
 │   └── ano=YYYY/mes=MM/grid_id=PT-XXX/*.parquet
-├── meteorologia/        ← ERA5 (após EDA_ERA5.py da Pessoa B)
-└── agregados_streaming/ ← Spark streaming em tempo real
+├── meteorologia/        ← ERA5 (após EDA_ERA5.py)
+└── agregados_streaming/ ← Spark streaming em tempo real (automático)
 ```
 
+> **Nota:** O `carga-historico` só carrega dados para o S3 quando encontra Parquet gerados pelas EDAs. Se as EDAs ainda não correram, o serviço avisa nos logs e não carrega nada. Ver logs: `docker compose logs carga-historico`
+
 Para validar o estado do data lake, corre no Jupyter:
-```python
-# Abre notebooks/validar_datalake.py numa célula do Jupyter
+```bash
+python /home/jovyan/work/validar_datalake.py
 ```
 
 ---
@@ -247,21 +249,27 @@ SELECT COUNT(*) FROM sensor_readings;
 
 ---
 
-## Dados históricos NASA
+## Dados históricos — população do S3
 
-Os CSV históricos (2020-2024) devem estar em `notebooks/NASACSV/`:
+O S3 só é populado quando as EDAs da Pessoa B tiverem corrido. O `carga-historico` verifica automaticamente ao arrancar:
+
 ```
-viirs-snpp_2020_Portugal.csv
-viirs-jpss1_2020_Portugal.csv
-... (10 ficheiros no total)
+EDA_NASA.py correu → Filtragem_Parquet/ existe → carrega hotspots/ no S3
+EDA_ERA5.py correu → ERA5_Parquet/ existe     → carrega meteorologia/ no S3
+Nenhuma EDA correu → avisa nos logs e não carrega nada
 ```
 
-O serviço `carga-historico` carrega-os automaticamente para o S3 ao arrancar.
-Se a pasta estiver vazia, o histórico pode ser carregado manualmente:
+Para ver o estado da verificação:
 ```bash
-# No terminal do Jupyter
-python /home/jovyan/work/carga_historico_s3.py
+docker compose logs carga-historico
 ```
+
+Para forçar uma re-carga manual após correr as EDAs:
+```bash
+docker compose restart carga-historico
+```
+
+Os CSV históricos em `notebooks/NASACSV/` são usados **apenas pelas EDAs** (não pelo carga-historico directamente).
 
 ---
 
@@ -275,8 +283,8 @@ docker compose down
 docker compose down -v
 ```
 
-> **Atenção:** `docker compose down -v` apaga os dados históricos do S3.
-> Na próxima vez que arrancar, o `carga-historico` recarrega automaticamente.
+> **Atenção:** `docker compose down -v` apaga os dados históricos do S3 e do Cassandra.
+> Na próxima vez que arrancar, o `carga-historico` recarrega automaticamente desde que os Parquet das EDAs existam.
 
 ---
 
@@ -308,11 +316,12 @@ Verifica se tens outro serviço nas portas 8080, 8086, 8888, 9042 ou 29092.
 Na primeira execução descarrega os packages (~1-2 min). As janelas de
 10 min precisam de acumular eventos antes de fechar e mostrar agregações (~12 min).
 
-**S3 histórico vazio após `docker compose down -v`**  
-O `carga-historico` recarrega automaticamente ao arrancar.
-Se os CSV não estiverem em `notebooks/NASACSV/`, corre manualmente:
+**S3 histórico vazio após `docker compose down -v`**
+O `carga-historico` verifica ao arrancar se há Parquet das EDAs e recarrega automaticamente se existirem. Se as EDAs ainda não tiverem corrido, o S3 fica vazio — é o comportamento esperado.
+
 ```bash
-python /home/jovyan/work/carga_historico_s3.py
+# Ver o que o carga-historico decidiu fazer
+docker compose logs carga-historico
 ```
 
 ---

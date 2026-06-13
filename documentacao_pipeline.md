@@ -29,14 +29,18 @@ A pipeline processa dados de incêndio florestal em tempo real, desde a recolha 
 FLUXO 1 — TEMPO REAL (contínuo, arranca com docker compose up)
 ─────────────────────────────────────────────────────────────
 producer_sensores.py  ─┐
-                       ├──► Kafka ──► consumer_kafka_cassandra.py ──► Cassandra
-producer_apis_reais.py ─┘             └──► InfluxDB (métricas)
-                                      └──► Kafka (quarentena)
+                       ├──► Kafka ──► consumer_kafka_cassandra.py ──► Cassandra (sensor_readings)
+producer_apis_reais.py ─┘             ├──► Cassandra (fire_alerts) se risk >= 60
+                                      ├──► Kafka (fire-alerts) se temp>35 E hum<20 E vento>30
+                                      ├──► Kafka (data-quality-metrics) eventos inválidos
+                                      └──► InfluxDB (métricas de qualidade e latência)
                          Kafka ──► spark_streaming_agregacao.py ──► S3 + console
 
-FLUXO 2 — BATCH HISTÓRICO (corre uma vez ao arrancar, se S3 vazio)
+FLUXO 2 — BATCH HISTÓRICO (gerido pelo check_and_load.sh)
 ─────────────────────────────────────────────────────────────────
-carga_historico_s3.py ──► S3 (Parquet histórico NASA FIRMS + ERA5)
+check_and_load.sh ──► verifica Parquet EDAs vs S3
+                       ├── Parquet EDA mais recente → carga_historico_s3.py ──► S3
+                       └── Sem Parquet EDA → avisa e não carrega nada
 ```
 
 **Cada ficheiro tem uma responsabilidade única e bem definida.**
@@ -239,14 +243,15 @@ Kafka (sensor-events)
        │
        ▼
   Acumula batch
-  (10 eventos ou 2 min)
+  (3 eventos ou 30s)
        │
        ▼
   Validação de qualidade
   (data_quality_validation.py)
        │
        ├──► Eventos VÁLIDOS ──► Cassandra (sensor_readings)
-       │                    ──► Cassandra (fire_alerts) se risco >= 60
+       │                    ──► Cassandra (fire_alerts) se risk_score >= 60
+       │                    ──► Kafka (fire-alerts) se temp>35 E hum<20 E vento>30
        │                    ──► InfluxDB (latência)
        │
        └──► Eventos INVÁLIDOS ──► Kafka (data-quality-metrics)
@@ -269,15 +274,24 @@ humidity_pct, wind_kmh, source
 
 ### Sistema de micro-batches
 Em vez de processar evento a evento (ineficiente), o consumer acumula eventos num batch e processa-os juntos. O batch fecha quando:
-- Atingiu **10 eventos** (`BATCH_SIZE=10`), ou
-- Passaram **2 minutos** sem novos eventos (`BATCH_TIMEOUT=120`)
+- Atingiu **3 eventos** (`BATCH_SIZE=3`), ou
+- Passaram **30 segundos** sem novos eventos (`BATCH_TIMEOUT=30`)
 
 Isto equilibra eficiência (menos operações Cassandra) e latência (não espera demasiado).
+
+### Alertas no topic `fire-alerts`
+Para além de gravar em Cassandra quando `risk_score >= 60`, o consumer publica também no topic `fire-alerts` quando as condições meteorológicas brutas atingem os limiares definidos no documento:
+
+```
+temperatura > 35°C  E  humidade < 20%  E  vento > 30 km/h
+```
+
+Esta verificação é **independente do `risk_score`** — avalia directamente os valores medidos. O evento publicado inclui um campo `trigger` com os valores exactos que dispararam o alerta, facilitando o debugging pela Pessoa C.
 
 ### Dois consumers em paralelo
 O ficheiro corre **dois threads** em simultâneo:
 
-1. **`consume_sensor_events`** — lê `sensor-events`, valida com GE, grava em `sensor_readings` e `fire_alerts`
+1. **`consume_sensor_events`** — lê `sensor-events`, valida com GE, grava em `sensor_readings` e `fire_alerts`, publica em `fire-alerts` quando condições críticas
 2. **`consume_satellite_hotspots`** — lê `satellite-hotspots` (NASA), valida com regras específicas NASA, grava em `sensor_readings` ou quarentena
 
 ### Validação dos dados NASA (correcção de gap)
@@ -292,14 +306,14 @@ Os dados NASA não passam pela validação GE dos sensores IoT porque têm campo
 | `longitude` | -9.5 – -6.2 | Bounding box Portugal Continental |
 | `grid_id` | não PT-UNKNOWN | PT-UNKNOWN indica falha de mapeamento de coordenadas |
 
-Hotspots que falham estas regras vão para quarentena (`data-quality-metrics`) em vez de serem gravados silenciosamente no Cassandra. A metrica de rejeição é visível no Grafana tal como para os sensores IoT.
+Hotspots que falham estas regras vão para quarentena (`data-quality-metrics`) em vez de serem gravados silenciosamente no Cassandra. A métrica de rejeição é visível no Grafana tal como para os sensores IoT.
 
 ### Classificação de risco
 ```python
 risk_score < 30  → "LOW"      (verde)
 risk_score < 60  → "MEDIUM"   (amarelo)
-risk_score < 80  → "HIGH"     (laranja)  → gera alerta
-risk_score >= 80 → "CRITICAL" (vermelho) → gera alerta
+risk_score < 80  → "HIGH"     (laranja)  → gera alerta Cassandra
+risk_score >= 80 → "CRITICAL" (vermelho) → gera alerta Cassandra
 ```
 
 ### Configuração
@@ -308,8 +322,8 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 CASSANDRA_HOST  = os.getenv("CASSANDRA_HOST",  "cassandra")
 INFLUX_URL      = os.getenv("INFLUXDB_URL",    "http://influxdb:8086")
 INFLUX_TOKEN    = os.getenv("INFLUXDB_TOKEN",  "...")
-BATCH_SIZE      = 10   # eventos por batch
-BATCH_TIMEOUT   = 120  # segundos máximos por batch
+BATCH_SIZE      = 3    # eventos por batch
+BATCH_TIMEOUT   = 30   # segundos máximos por batch
 ```
 
 ---
@@ -345,6 +359,8 @@ Define regras de validação para os campos numéricos dos eventos:
 
 ### Funções principais
 
+**Para sensores IoT:**
+
 **`split_valid_invalid(batch)`** — função mais usada. Recebe uma lista de eventos e devolve dois grupos:
 ```python
 valid_events, invalid_events = split_valid_invalid(batch)
@@ -363,6 +379,12 @@ valid_events, invalid_events = split_valid_invalid(batch)
   "rejection_reasons": ["temp_celsius_out_of_range(999.9)"]
 }
 ```
+
+**Para hotspots NASA (funções específicas):**
+
+**`split_valid_invalid_nasa(batch)`** — aplica as regras NASA (FRP, brightness, coordenadas, grid_id) evento a evento. Análoga a `split_valid_invalid()` mas com regras físicas diferentes.
+
+**`build_rejected_record_nasa(ev)`** — formata um hotspot inválido para quarentena com os campos relevantes da NASA (latitude, longitude, frp_mw, brightness, confidence).
 
 ---
 
@@ -511,29 +533,22 @@ spark-submit \
 ## 8. carga_historico_s3.py
 
 ### O que é
-Script Python que **carrega dados históricos** (5 anos de hotspots NASA + dados ERA5) para o S3, em formato Parquet particionado. É uma carga única (ou re-carga quando o S3 está vazio).
+Script Python que **carrega dados históricos das EDAs** para o S3 em formato Parquet particionado. Só é chamado quando o `check_and_load.sh` detecta que os Parquet das EDAs são mais recentes que os dados no S3.
 
 ### Quando é usado
-Chamado automaticamente pelo container `carga-historico` ao arrancar, via `check_and_load.sh`. O script `check_and_load.sh` verifica primeiro se os dados já existem — se sim, não faz nada; se não, chama este script.
+Chamado pelo `check_and_load.sh` (container `carga-historico`) nas seguintes condições:
+- S3 vazio e Parquet das EDAs disponíveis → carrega
+- Parquet das EDAs mais recentes que os dados no S3 → recarrega
 
-### Dois modos de funcionamento
+**Não é chamado automaticamente** se não houver Parquet das EDAs — o `check_and_load.sh` avisa e para sem chamar este script.
 
-**Modo 1 — Parquet das EDAs (preferido)**  
-Quando a Pessoa B já correu `EDA_NASA.py` e `EDA_ERA5.py`, os dados estão limpos e processados em:
-- `notebooks/Filtragem_Parquet/firms_portugal_limpo_todos.parquet`
-- `notebooks/ERA5_Parquet/era5_portugal_todos.parquet`
+### Modo de funcionamento — apenas Parquet das EDAs
 
-O script lê estes ficheiros directamente, adiciona `grid_id`, e grava no S3.
+O script lê os Parquet gerados pelas EDAs da Pessoa B:
+- `notebooks/Filtragem_Parquet/` → gerado pela `EDA_NASA.py` (hotspots NASA FIRMS)
+- `notebooks/ERA5_Parquet/` → gerado pela `EDA_ERA5.py` (meteorologia ERA5)
 
-**Modo 2 — CSV brutos (fallback)**  
-Se as EDAs ainda não correram, o script vai buscar os CSV originais em `notebooks/NASACSV/` e replica a lógica da EDA:
-1. Lê todos os CSV `viirs-*.csv`
-2. Detecta o satélite pelo nome do ficheiro (SNPP ou NOAA-20)
-3. Converte datas e cria colunas `ano`, `mes`, `dia`
-4. **Filtra para Portugal** usando bounding box (lat 36.9-42.2, lon -9.5–-6.2)
-5. Não remove `confidence='l'` (alinhado com a EDA)
-
-**Importante:** Em ambos os modos, o script **adiciona o `grid_id`** mapeando as coordenadas GPS para a zona de Portugal mais próxima (os 10 centroides da grelha). Este enriquecimento não é feito pelas EDAs.
+Em ambos os casos, o script **adiciona o `grid_id`** mapeando as coordenadas GPS para a zona de Portugal mais próxima (os 10 centroides da grelha). Este enriquecimento não é feito pelas EDAs.
 
 ### O que grava no S3
 
@@ -590,7 +605,10 @@ Quando se executa `docker compose up`, os serviços arrancam nesta ordem e os sc
 
 6. kafka-setup       → cria os 5 topics
 7. cassandra-setup   → cria as tabelas CQL
-8. carga-historico   → check_and_load.sh → carga_historico_s3.py (se S3 vazio)
+8. carga-historico   → check_and_load.sh:
+                         ├── sem Parquet EDAs → avisa e para
+                         ├── Parquet EDAs mais recentes que S3 → carga_historico_s3.py
+                         └── S3 actualizado → salta
 
 9. grafana           → dashboard de monitorização
 10. jupyter          → ambiente de desenvolvimento
@@ -615,11 +633,11 @@ producer_apis_reais.py    ──► Kafka ──┤ (satellite-hotspots, weather
                                 │     ├── data_quality_validation.py
                                 │     └── data_quality.py
                                 │
-                         ┌──────┴──────┐
-                         ▼             ▼
-                      Cassandra    InfluxDB
-                   (sensor_readings) (métricas)
-                   (fire_alerts)
+                    ┌───────────┼───────────────┐
+                    ▼           ▼               ▼
+                Cassandra    InfluxDB         Kafka
+            (sensor_readings) (métricas)  (fire-alerts)
+            (fire_alerts)                 (data-quality-metrics)
 
 Kafka (3 topics) ──► spark_streaming_agregacao.py
                                 │
@@ -628,8 +646,9 @@ Kafka (3 topics) ──► spark_streaming_agregacao.py
                       Console        S3 Parquet
                                 (agregados_streaming/)
 
-CSV históricos / Parquet EDA ──► carga_historico_s3.py ──► S3 Parquet
-                                                        (hotspots/ + meteorologia/)
+Parquet EDAs ──► check_and_load.sh ──► carga_historico_s3.py ──► S3 Parquet
+(Filtragem_Parquet/                                          (hotspots/ + meteorologia/)
+ ERA5_Parquet/)
 ```
 
 ### Ficheiros que importam outros ficheiros
@@ -643,7 +662,8 @@ CSV históricos / Parquet EDA ──► carga_historico_s3.py ──► S3 Parqu
 - `producer_sensores.py` — corre directamente
 - `producer_apis_reais.py` — corre directamente
 - `spark_streaming_agregacao.py` — corre via spark-submit
-- `carga_historico_s3.py` — corre directamente
+- `carga_historico_s3.py` — corre directamente (chamado pelo `check_and_load.sh`)
+- `check_and_load.sh` — script bash, chamado pelo container `carga-historico`
 
 ### Ficheiros que são apenas módulos (não correm directamente)
 - `data_quality_validation.py` — importado pelo consumer

@@ -14,6 +14,7 @@
 5. [data_quality.py](#5-data_qualitypy)
 6. [spark_streaming_agregacao.py](#6-spark_streaming_agregacaopy)
 7. [carga_historico_s3.py](#7-carga_historico_s3py)
+8. [check_and_load.sh](#8-check_and_loadsh)
 
 ---
 
@@ -524,7 +525,7 @@ Converte o `risk_score` numérico (0–100) em categoria textual. As categorias 
 ### Passo 5 — Persistir evento válido: `persist_valid_event()` (linhas 125–162)
 
 ```python
-def persist_valid_event(session, insert_sensor, insert_alert, write_api, ev):
+def persist_valid_event(session, insert_sensor, insert_alert, write_api, fire_alert_producer, ev):
     # 5a. Parseia o timestamp e calcula o hour_bucket
     ts          = datetime.fromisoformat(ev["timestamp"].replace("Z", "+00:00"))
     hour_bucket = ts.strftime("%Y-%m-%dT%H:00:00")
@@ -536,18 +537,35 @@ def persist_valid_event(session, insert_sensor, insert_alert, write_api, ev):
     latency_ms = (datetime.now(timezone.utc) - ts).total_seconds() * 1000
     send_latency(write_api, ..., latency_ms, "sensor-events", ev["grid_id"])
 
-    # 5d. Se risco alto/crítico, cria alerta
+    # 5d. Se risco alto/crítico, cria alerta no Cassandra
     nivel = risk_level(float(ev["risk_score"]))
     if nivel in ("HIGH", "CRITICAL"):
         session.execute(insert_alert, (ev["grid_id"], ts, score, nivel, ...))
         log.warning(f"🔥 ALERTA {nivel} — ...")
+
+    # 5e. Publica no topic fire-alerts se condições meteorológicas críticas
+    temp_ev  = float(ev.get("temp_celsius", 0))
+    hum_ev   = float(ev.get("humidity_pct", 100))
+    vento_ev = float(ev.get("wind_kmh", 0))
+
+    if temp_ev > 35 and hum_ev < 20 and vento_ev > 30:
+        alerta = {
+            "grid_id":    ev["grid_id"],
+            "risk_level": nivel,
+            "temp_celsius": temp_ev,
+            "humidity_pct": hum_ev,
+            "wind_kmh":   vento_ev,
+            "trigger":    f"temp>{temp_ev}C hum<{hum_ev}% vento>{vento_ev}kmh"
+        }
+        fire_alert_producer.send("fire-alerts", key=ev["grid_id"], value=alerta)
 ```
 
 **Sub-passos:**
 - **5a — `replace("Z", "+00:00")`:** Conversão necessária porque o Python < 3.11 não aceita o sufixo `Z` directamente no `fromisoformat`
 - **5b — Sempre grava em `sensor_readings`:** Todas as leituras válidas ficam persistidas, independentemente do nível de risco
 - **5c — Latência:** Mede o tempo entre o `timestamp` do evento (quando foi criado pelo producer) e o momento actual (quando está a ser gravado). Latências altas indicam problemas de throughput
-- **5d — Alertas condicionais:** Só cria registo em `fire_alerts` quando o risco é HIGH (≥60) ou CRITICAL (≥80) — evita encher a tabela com dados de baixo risco
+- **5d — Alertas por risk_score:** Só cria registo em `fire_alerts` (Cassandra) quando o risco é HIGH (≥60) ou CRITICAL (≥80)
+- **5e — Alertas por condições brutas:** Publicação no topic `fire-alerts` (Kafka) independente do `risk_score` — verifica directamente os valores meteorológicos. A regra `temp>35 E hum<20 E vento>30` está definida no documento do projecto (secção 3.2). O campo `trigger` regista os valores exactos que dispararam o alerta.
 
 ---
 
@@ -1078,7 +1096,7 @@ spark.streams.awaitAnyTermination()  # espera que qualquer stream termine
 
 ## 7. carga_historico_s3.py
 
-**Papel:** Carrega dados históricos da NASA (e ERA5) para o S3 em Parquet particionado.
+**Papel:** Carrega dados históricos das EDAs para o S3 em Parquet particionado. Só é chamado pelo `check_and_load.sh` quando os Parquet das EDAs existem e são mais recentes que os dados no S3.
 
 ---
 
@@ -1088,14 +1106,15 @@ spark.streams.awaitAnyTermination()  # espera que qualquer stream termine
 BASE_DIR       = Path(os.getenv("BASE_DIR", "/home/jovyan/work"))
 PASTA_EDA_NASA = BASE_DIR / "Filtragem_Parquet"   # gerado pela EDA_NASA.py
 PASTA_EDA_ERA5 = BASE_DIR / "ERA5_Parquet"         # gerado pela EDA_ERA5.py
-PASTA_CSV_NASA = BASE_DIR / "NASACSV"              # CSV originais da NASA
 
 # Bbox Portugal Continental
 LAT_MIN, LAT_MAX = 36.9, 42.2
 LON_MIN, LON_MAX = -9.5, -6.2
 ```
 
-Define os dois modos possíveis de entrada através das pastas. A bounding box (`bbox`) filtra hotspots fora de Portugal — a NASA FIRMS devolve dados para toda a área mas só interessam os de Portugal.
+Define as pastas onde as EDAs da Pessoa B depositam os Parquet limpos. A bounding box é usada internamente pela função `coords_para_grid` para verificar coordenadas.
+
+Nota: a variável `PASTA_CSV_NASA` ainda existe no código por compatibilidade mas já não é chamada automaticamente — o `check_and_load.sh` garante que este script só é invocado quando há Parquet das EDAs disponíveis.
 
 ---
 
@@ -1105,7 +1124,7 @@ Define os dois modos possíveis de entrada através das pastas. A bounding box (
 def ler_parquet_eda(pasta, prefixo, nome_eda):
     pasta = Path(pasta)
     if not pasta.exists():
-        return None    # pasta não existe → modo 2 (CSV)
+        return None    # pasta não existe → devolve None
 
     # Tenta ficheiro combinado primeiro (mais rápido)
     f_todos = pasta / f"{prefixo}_todos.parquet"
@@ -1123,13 +1142,13 @@ def ler_parquet_eda(pasta, prefixo, nome_eda):
 ```
 
 **Sub-passos:**
-- Retorna `None` (não levanta excepção) se a pasta não existir — permite ao `main()` tentar o modo 2 sem crashes
+- Retorna `None` (não levanta excepção) se a pasta não existir — o `main()` trata o `None` e avisa
 - Prefere o ficheiro `_todos.parquet` (mais eficiente que ler N ficheiros individuais)
-- Fallback para ficheiros por ano quando o `_todos` não existe
+- Fallback para ficheiros por ano quando o `_todos` não existe (algumas EDAs geram um ficheiro por ano)
 
 ---
 
-### Passo 3 — Leitura CSV (modo 2): `ler_csv_como_eda()` (linhas 89–142)
+### Passo 3 — Leitura CSV (uso manual): `ler_csv_como_eda()` (linhas 89–142)
 
 ```python
 def ler_csv_como_eda(pasta):
@@ -1164,6 +1183,8 @@ def ler_csv_como_eda(pasta):
     cols = [c for c in COLUNAS_EDA if c in df_pt.columns]
     return df_pt[cols]
 ```
+
+**Nota importante:** Esta função existe no código mas **não é chamada automaticamente** pelo `check_and_load.sh`. O `check_and_load.sh` garante que este script só é invocado quando há Parquet das EDAs disponíveis. A função `ler_csv_como_eda` só é usada se alguém correr o `carga_historico_s3.py` manualmente e não existirem Parquet das EDAs.
 
 **Sub-passos:**
 - **3a — Detecção por nome:** `viirs-snpp_2020.csv` → `VIIRS S-NPP`; `viirs-jpss1_2020.csv` → `VIIRS NOAA-20`
@@ -1225,36 +1246,152 @@ def gravar_s3(df, prefixo, partition_cols):
 
 ---
 
-### Passo 7 — Main com lógica de fallback (linhas 206–265)
+### Passo 7 — Main: carrega Parquet das EDAs (linhas 206–265)
 
 ```python
 def main():
-    # NASA FIRMS
+    # NASA FIRMS — lê Parquet da EDA_NASA.py
     df_nasa = ler_parquet_eda(PASTA_EDA_NASA, "firms_portugal_limpo", "EDA_NASA")
-
-    if df_nasa is not None:
-        print("Modo: Parquet EDA_NASA.py")
-    else:
-        print(f"EDA não correu. A ler CSV de '{PASTA_CSV_NASA}'...")
-        df_nasa = ler_csv_como_eda(PASTA_CSV_NASA)
 
     if df_nasa is not None:
         df_nasa = adicionar_grid_id(df_nasa)
         gravar_s3(df_nasa, PREFIXO_NASA, ["ano", "mes", "grid_id"])
         verificar_s3(PREFIXO_NASA)
+    else:
+        print("SALTADO: Filtragem_Parquet/ não encontrada ou vazia")
 
-    # ERA5 (só se EDA correu)
+    # ERA5 — lê Parquet da EDA_ERA5.py (só se EDA correu)
     df_era5 = ler_parquet_eda(PASTA_EDA_ERA5, "era5_portugal", "EDA_ERA5")
     if df_era5 is not None:
         df_era5 = preparar_era5(df_era5)
         gravar_s3(df_era5, PREFIXO_ERA5, ["ano", "mes"])
+    else:
+        print("SALTADO: ERA5_Parquet/ não encontrada — EDA_ERA5.py ainda não correu")
 ```
 
-A lógica de fallback é assimétrica:
-- **NASA:** tenta Parquet EDA → tenta CSV → avisa se nenhum
-- **ERA5:** só tenta Parquet EDA → avisa se não existe (não há CSV bruto ERA5)
+**Sub-passos:**
+- **NASA:** lê `Filtragem_Parquet/` gerado pela `EDA_NASA.py`. Se não existir, salta e avisa — não há fallback automático para CSV
+- **ERA5:** lê `ERA5_Parquet/` gerado pela `EDA_ERA5.py`. Também salta se não existir — é esperado durante o desenvolvimento
+- A assimetria é intencional: ambos dependem exclusivamente dos Parquet das EDAs. O `check_and_load.sh` garante que este script só é chamado quando pelo menos uma EDA correu
 
-Isto reflecte a realidade: os CSV NASA estão disponíveis desde o início do projecto, mas o ERA5 só existe depois da Pessoa B correr a EDA.
+---
+
+## 8. check_and_load.sh
+
+**Papel:** Script bash chamado pelo container `carga-historico` ao arrancar. Decide se os dados históricos precisam de ser carregados para o S3 comparando as datas dos Parquet das EDAs com os dados já no S3.
+
+---
+
+### Passo 1 — Array de EDAs registadas
+
+```bash
+EDAS=(
+    "EDA_NASA.py|/home/jovyan/work/Filtragem_Parquet|Hotspots NASA FIRMS (satélite)"
+    "EDA_ERA5.py|/home/jovyan/work/ERA5_Parquet|Meteorologia ERA5 (Copernicus)"
+    "EDA_ICNF.py|/home/jovyan/work/ICNF_Parquet|Cartografia florestal ICNF (COS2018)"
+)
+```
+
+Array central do script — regista todas as EDAs esperadas com o formato `NOME|PASTA|DESCRIÇÃO`. Para adicionar uma EDA nova basta acrescentar uma linha. O script itera sobre este array em todos os passos seguintes.
+
+---
+
+### Passo 2 — Verifica quais EDAs já correram
+
+```bash
+for entry in "${EDAS[@]}"; do
+    NOME=$(echo "$entry" | cut -d'|' -f1)
+    PASTA=$(echo "$entry" | cut -d'|' -f2)
+
+    N=$(find "$PASTA" -name "*.parquet" 2>/dev/null | wc -l)
+
+    if [ "$N" -gt 0 ]; then
+        EDAS_PRONTAS+=("$entry")   # tem Parquet → pronta
+        ALGUMA_DISPONIVEL=1
+    else
+        EDAS_EM_FALTA+=("$NOME|$DESC")  # sem Parquet → avisa
+    fi
+done
+```
+
+Itera sobre todas as EDAs e conta os ficheiros `.parquet` na pasta de cada uma. Popula dois arrays: `EDAS_PRONTAS` (têm Parquet, podem ser carregadas) e `EDAS_EM_FALTA` (ainda não correram). `2>/dev/null` suprime o erro se a pasta não existe.
+
+---
+
+### Passo 3 — Se nenhuma EDA correu, avisa e para
+
+```bash
+if [ $ALGUMA_DISPONIVEL -eq 0 ]; then
+    echo "Para ser possível popular o data lake, o responsável pelos"
+    echo "EDAs tem de correr e validar primeiro os respectivos:"
+    for entry in "${EDAS_EM_FALTA[@]}"; do
+        echo "  → python /home/jovyan/work/$NOME   ($DESC)"
+    done
+    exit 0   # saída limpa — não é erro, é estado esperado
+fi
+```
+
+Se zero EDAs têm Parquet, lista todas com o comando exacto para as correr e termina sem tocar no S3. `exit 0` (não `exit 1`) porque não é um erro — é o estado esperado durante o desenvolvimento antes das EDAs correrem.
+
+---
+
+### Passo 4 — Avisa EDAs em falta sem bloquear as disponíveis
+
+```bash
+if [ ${#EDAS_EM_FALTA[@]} -gt 0 ]; then
+    echo "⏳ As seguintes EDAs ainda não correram (dados parciais no S3):"
+    for entry in "${EDAS_EM_FALTA[@]}"; do
+        echo "  → python /home/jovyan/work/$NOME"
+    done
+fi
+```
+
+Se algumas EDAs correram e outras não, avisa sobre as que faltam mas **não bloqueia** — é preferível ter dados parciais no S3 a não ter nada. O script continua com as EDAs disponíveis.
+
+---
+
+### Passo 5 — Compara datas Parquet vs S3 (Python interno)
+
+```python
+# Data do Parquet mais recente entre todas as pastas EDA disponíveis
+data_parquet = max(f.stat().st_mtime for f in todos_parquets)
+
+# Data do objecto S3 mais recente em hotspots/
+resp = s3.list_objects_v2(Bucket='forest-risk-datalake', Prefix='hotspots/')
+data_s3 = max(o['LastModified'] for o in objectos)
+
+if data_parquet_dt > data_s3:
+    sys.exit(1)   # Parquet mais recente → recarregar
+else:
+    sys.exit(0)   # S3 actualizado → saltar
+```
+
+Usa Python (embutido no bash via heredoc) para comparar datas porque o boto3 facilita a ligação ao S3. `st_mtime` é o timestamp Unix da última modificação do ficheiro. O `LastModified` do S3 já vem com timezone UTC. Códigos de saída: `0` = saltar, `1` = carregar, `2` = sem Parquet.
+
+---
+
+### Passo 6 — Decisão final e carga
+
+```bash
+if [ $STATUS -eq 0 ]; then
+    echo "✅ S3 está actualizado — carga saltada."
+    exit 0
+fi
+
+# STATUS=1: S3 vazio ou desactualizado → carrega
+python3 /home/jovyan/work/carga_historico_s3.py
+```
+
+Só chega aqui se o S3 está vazio ou os Parquet das EDAs são mais recentes. Chama o `carga_historico_s3.py` que lê os Parquet e grava no S3.
+
+**Resumo dos 4 cenários possíveis:**
+
+| Cenário | O que acontece |
+|---|---|
+| Sem Parquet EDAs | Avisa com instruções e para |
+| S3 vazio + Parquet EDAs | Carrega para o S3 |
+| Parquet EDAs mais recentes que S3 | Recarrega o S3 |
+| S3 actualizado | Salta sem fazer nada |
 
 ---
 
